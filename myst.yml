@@ -1,0 +1,22 @@
+version: 1
+project:
+  title: "Opticus: Understanding Text-to-Image Generation"
+  authors:
+    - name: "Zack Hubert"
+  exclude:
+    - .venv
+    - _build
+    - "**.ipynb_checkpoints"
+    - .git
+    - README.md
+  github: zhubert/opticus
+  toc:
+    - file: intro.md
+    - file: PROJECT.md
+      title: Project Roadmap
+    - file: notebooks/01_flow_matching_basics.ipynb
+      title: "Phase 1: Flow Matching"
+site:
+  options:
+    logo: opticus.png
+  template: book-theme

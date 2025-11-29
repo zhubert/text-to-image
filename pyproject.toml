@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opticus"
+version = "0.1.0"
+description = "Educational project for understanding text-to-image generation with Flow Matching and DiT"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+    "numpy>=1.24",
+    "jupyter>=1.0",
+    "ipywidgets>=8.0",
+    "jupyter-book>=1.0,<2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
