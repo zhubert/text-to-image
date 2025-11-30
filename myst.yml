@@ -16,6 +16,12 @@ project:
       title: "Phase 1: Flow Matching"
     - file: notebooks/02_diffusion_transformer.ipynb
       title: "Phase 2: Diffusion Transformer"
+    - file: notebooks/03_class_conditioning.ipynb
+      title: "Phase 3: Class Conditioning"
+    - file: notebooks/04_text_conditioning.ipynb
+      title: "Phase 4: Text Conditioning"
+    - file: notebooks/05_latent_diffusion.ipynb
+      title: "Phase 5: Latent Diffusion"
 site:
   options:
     logo: text-to-image.png
