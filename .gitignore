@@ -15,5 +15,8 @@ _build/
 # Notebook data
 notebooks/data/
 
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
 # Backup files
 *.bak

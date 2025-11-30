@@ -19,7 +19,35 @@ dependencies = [
     "jupyter-book>=1.0,<2.0",
 ]
 
+[project.optional-dependencies]
+rocm = [
+    "torch>=2.5.0; sys_platform == 'linux'",
+    "torchvision>=0.20; sys_platform == 'linux'",
+    "pytorch-triton-rocm; sys_platform == 'linux'",
+]
+
 [dependency-groups]
 dev = [
-    "pytest>=7.0",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+]
+
+# PyTorch backend configuration
+# By default, uses PyPI torch (CUDA on Linux, CPU elsewhere)
+# For AMD GPUs (Linux only): uv sync --extra rocm
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
+
+[tool.uv.sources]
+# When rocm extra is requested, get torch from ROCm index on Linux
+torch = [
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm", marker = "sys_platform == 'linux'" },
 ]
