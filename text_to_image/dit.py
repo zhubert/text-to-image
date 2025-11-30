@@ -12,6 +12,11 @@ Phase 3 adds class-conditional generation:
 2. Combines class embedding with timestep embedding
 3. Supports classifier-free guidance (CFG) via label dropout
 
+Phase 4 adds text-conditional generation:
+1. Uses CLIP text encoder (frozen) to embed text prompts
+2. Adds cross-attention layers to attend to text tokens
+3. Enables natural language control: "a photo of a cat" → cat image
+
 Reference: "Scalable Diffusion Models with Transformers" (Peebles & Xie, 2022)
 https://arxiv.org/abs/2212.09748
 """
@@ -614,6 +619,516 @@ class ConditionalDiT(nn.Module):
         # Process through transformer blocks
         for block in self.blocks:
             x = block(x, cond)
+
+        # Final projection
+        x = self.final_norm(x)
+        x = self.final_proj(x)  # (B, num_patches, patch_dim)
+
+        # Unpatchify to image
+        x = self.unpatchify(x)  # (B, C, H, W)
+
+        return x
+
+
+# =============================================================================
+# Phase 4: Text-Conditional DiT with Cross-Attention
+# =============================================================================
+
+
+class CrossAttention(nn.Module):
+    """
+    Cross-attention layer for attending to text embeddings.
+
+    Mathematical Framework
+    ----------------------
+    Cross-attention allows image patches to attend to text tokens:
+
+        CrossAttn(X, Z) = softmax(Q K^T / sqrt(d)) V
+
+    where:
+        Q = X @ W_Q in R^{N x d}     (queries from image patches)
+        K = Z @ W_K in R^{M x d}     (keys from text tokens)
+        V = Z @ W_V in R^{M x d}     (values from text tokens)
+
+    Here:
+        X in R^{N x d} = image patch embeddings (N patches)
+        Z in R^{M x d} = text token embeddings (M tokens)
+        d = attention dimension
+
+    The attention matrix A = softmax(QK^T / sqrt(d)) in R^{N x M} tells us
+    how much each image patch should attend to each text token.
+
+    Intuition
+    ---------
+    For the prompt "a RED dog RUNNING":
+    - When generating color regions, patches attend strongly to "RED"
+    - When generating motion/pose, patches attend to "RUNNING"
+    - All patches attend somewhat to "dog" for overall structure
+
+    This is how text guides the generation at a fine-grained level.
+
+    Comparison to Self-Attention
+    ----------------------------
+    | Aspect       | Self-Attention        | Cross-Attention          |
+    |--------------|----------------------|--------------------------|
+    | Q, K, V from | Same sequence        | Q from X, K/V from Z     |
+    | Purpose      | Inter-patch relations | Text-to-image transfer   |
+    | Attention    | N x N                 | N x M                    |
+
+    Reference: "Attention Is All You Need" (Vaswani et al., 2017)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        context_dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            embed_dim: Dimension of image patch embeddings (query dimension).
+            context_dim: Dimension of text embeddings (key/value dimension).
+            num_heads: Number of attention heads.
+            dropout: Dropout rate on attention weights.
+        """
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.context_dim = context_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        # Query projection (from image patches)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+
+        # Key and Value projections (from text tokens)
+        self.k_proj = nn.Linear(context_dim, embed_dim)
+        self.v_proj = nn.Linear(context_dim, embed_dim)
+
+        # Output projection
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Compute cross-attention from image patches to text tokens.
+
+        Args:
+            x: Image patch embeddings of shape (B, N, embed_dim)
+               where N = number of patches.
+            context: Text token embeddings of shape (B, M, context_dim)
+               where M = number of text tokens.
+            context_mask: Optional attention mask of shape (B, M)
+               True for real tokens, False for padding.
+
+        Returns:
+            Attended features of shape (B, N, embed_dim).
+
+        Mathematical Details
+        --------------------
+        1. Project queries, keys, values:
+           Q = x @ W_Q,  K = context @ W_K,  V = context @ W_V
+
+        2. Reshape for multi-head attention:
+           Q: (B, N, H, d) -> (B, H, N, d)
+           K, V: (B, M, H, d) -> (B, H, M, d)
+
+        3. Compute attention scores:
+           A = softmax(Q @ K^T / sqrt(d))  shape: (B, H, N, M)
+
+        4. Apply attention to values:
+           out = A @ V  shape: (B, H, N, d)
+
+        5. Reshape and project:
+           out: (B, N, H*d) -> (B, N, embed_dim)
+        """
+        B, N, _ = x.shape
+        M = context.shape[1]
+        H = self.num_heads
+        d = self.head_dim
+
+        # Project
+        q = self.q_proj(x)        # (B, N, embed_dim)
+        k = self.k_proj(context)  # (B, M, embed_dim)
+        v = self.v_proj(context)  # (B, M, embed_dim)
+
+        # Reshape for multi-head attention
+        q = q.view(B, N, H, d).transpose(1, 2)  # (B, H, N, d)
+        k = k.view(B, M, H, d).transpose(1, 2)  # (B, H, M, d)
+        v = v.view(B, M, H, d).transpose(1, 2)  # (B, H, M, d)
+
+        # Compute attention scores
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, N, M)
+
+        # Apply mask for padding tokens
+        if context_mask is not None:
+            # context_mask: (B, M) -> (B, 1, 1, M)
+            mask = context_mask.unsqueeze(1).unsqueeze(2)
+            attn = attn.masked_fill(~mask, float("-inf"))
+
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        # Apply attention to values
+        out = attn @ v  # (B, H, N, d)
+
+        # Reshape and project
+        out = out.transpose(1, 2).reshape(B, N, self.embed_dim)  # (B, N, embed_dim)
+        out = self.out_proj(out)
+
+        return out
+
+
+class TextConditionedDiTBlock(nn.Module):
+    """
+    DiT block with both self-attention and cross-attention to text.
+
+    Architecture
+    ------------
+    Each block has three main components:
+
+    1. Self-Attention (with adaLN):
+       - Image patches attend to each other
+       - Captures spatial relationships
+
+    2. Cross-Attention (with adaLN):
+       - Image patches attend to text tokens
+       - Injects text conditioning
+
+    3. MLP (with adaLN):
+       - Per-patch nonlinear transformation
+
+    Block Diagram
+    -------------
+    ```
+                                    +------------------+
+                                    | Text Embeddings  |
+                                    |   Z in R^{M x D} |
+                                    +---------+--------+
+                                              |
+    x --> adaLN --> Self-Attn --> + --> adaLN --> Cross-Attn --> + --> adaLN --> MLP --> + --> out
+    |                             |   |                          |   |                   |
+    +-------(residual)------------+   +-------(residual)---------+   +----(residual)-----+
+    ```
+
+    Mathematical Formulation
+    ------------------------
+    Let x be the input, c be the timestep conditioning, Z be text embeddings:
+
+    x' = x + SelfAttn(adaLN(x, c))
+    x'' = x' + CrossAttn(adaLN(x', c), Z)
+    out = x'' + MLP(adaLN(x'', c))
+
+    The adaLN modulates each sublayer based on timestep, while
+    cross-attention modulates based on text content.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        cond_dim: int,
+        context_dim: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            embed_dim: Dimension of patch embeddings.
+            num_heads: Number of attention heads.
+            cond_dim: Dimension of timestep conditioning.
+            context_dim: Dimension of text embeddings.
+            mlp_ratio: MLP hidden dimension = embed_dim * mlp_ratio.
+            dropout: Dropout rate.
+        """
+        super().__init__()
+
+        # Self-attention with adaLN
+        self.norm1 = AdaLN(embed_dim, cond_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim, num_heads,
+            dropout=dropout, batch_first=True
+        )
+
+        # Cross-attention with adaLN
+        self.norm2 = AdaLN(embed_dim, cond_dim)
+        self.cross_attn = CrossAttention(
+            embed_dim, context_dim, num_heads, dropout
+        )
+
+        # MLP with adaLN
+        self.norm3 = AdaLN(embed_dim, cond_dim)
+        mlp_hidden = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Forward pass through the text-conditioned DiT block.
+
+        Args:
+            x: Patch embeddings of shape (B, N, embed_dim).
+            cond: Timestep conditioning of shape (B, cond_dim).
+            context: Text token embeddings of shape (B, M, context_dim).
+            context_mask: Optional mask of shape (B, M).
+
+        Returns:
+            Transformed embeddings of shape (B, N, embed_dim).
+        """
+        # Self-attention block with residual
+        x_norm = self.norm1(x, cond)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+
+        # Cross-attention block with residual
+        x_norm = self.norm2(x, cond)
+        cross_out = self.cross_attn(x_norm, context, context_mask)
+        x = x + cross_out
+
+        # MLP block with residual
+        x_norm = self.norm3(x, cond)
+        x = x + self.mlp(x_norm)
+
+        return x
+
+
+class TextConditionalDiT(nn.Module):
+    """
+    Diffusion Transformer with text conditioning via cross-attention.
+
+    This is the full text-to-image architecture. Given:
+    - Noisy image x_t
+    - Timestep t
+    - Text prompt "a photo of a cat"
+
+    The model predicts the velocity field v(x_t, t, text) that guides
+    generation toward images matching the text description.
+
+    Architecture Overview
+    ---------------------
+    ```
+    Text Prompt                    Noisy Image x_t          Timestep t
+         |                              |                       |
+         v                              v                       v
+    +---------+                  +-----------+           +-----------+
+    |  CLIP   |                  | Patchify  |           | Time Emb  |
+    | Encoder |                  | + PosEmb  |           |   (MLP)   |
+    +----+----+                  +-----+-----+           +-----+-----+
+         |                             |                       |
+         | Z in R^{M x D_text}         | X in R^{N x D}        | c in R^{D_cond}
+         |                             |                       |
+         |                             v                       |
+         |                    +-----------------+              |
+         +------------------->| TextConditioned |<-------------+
+                              |    DiT Blocks   |
+                              +--------+--------+
+                                       |
+                                       v
+                              +-----------------+
+                              |   Unpatchify    |
+                              +--------+--------+
+                                       |
+                                       v
+                              Velocity v in R^{C x H x W}
+    ```
+
+    Key Differences from ConditionalDiT
+    ------------------------------------
+    | Aspect          | ConditionalDiT         | TextConditionalDiT      |
+    |-----------------|------------------------|-------------------------|
+    | Conditioning    | Class labels (0-9)     | Text prompts            |
+    | Embedding       | Learnable table        | CLIP encoder (frozen)   |
+    | Integration     | Added to timestep      | Cross-attention         |
+    | Flexibility     | Fixed vocabulary       | Open vocabulary         |
+    | Representation  | D_cond vector          | M x D_text sequence     |
+
+    The cross-attention mechanism allows:
+    1. Per-token attention: "RED dog" -> color info from "RED"
+    2. Compositional understanding: "blue banana" works
+    3. Variable-length prompts: Short or long descriptions
+
+    Classifier-Free Guidance with Text
+    ----------------------------------
+    CFG works similarly to class-conditional:
+
+    v_cfg = v_uncond + w * (v_cond - v_uncond)
+
+    where:
+    - v_cond = model(x, t, text_embedding)
+    - v_uncond = model(x, t, null_text_embedding)
+
+    The "null text" is typically an empty string "", whose CLIP embedding
+    serves as the unconditional baseline.
+
+    Reference: "High-Resolution Image Synthesis with Latent Diffusion Models"
+    (Rombach et al., 2022) - Stable Diffusion uses this architecture.
+    """
+
+    def __init__(
+        self,
+        img_size: int = 32,
+        patch_size: int = 4,
+        in_channels: int = 3,
+        embed_dim: int = 256,
+        depth: int = 6,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        context_dim: int = 512,
+    ):
+        """
+        Args:
+            img_size: Input image size (assumes square).
+            patch_size: Size of each patch.
+            in_channels: Number of input channels (3 for RGB).
+            embed_dim: Transformer embedding dimension.
+            depth: Number of transformer blocks.
+            num_heads: Number of attention heads.
+            mlp_ratio: MLP hidden dim = embed_dim * mlp_ratio.
+            dropout: Dropout rate.
+            context_dim: Dimension of text embeddings (512 for CLIP ViT-B).
+        """
+        super().__init__()
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.context_dim = context_dim
+
+        # Patch embedding
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
+        grid_size = self.patch_embed.grid_size
+
+        # Positional embedding
+        self.pos_embed = SinusoidalPosEmb2D(embed_dim, grid_size)
+
+        # Timestep embedding
+        cond_dim = embed_dim * 4
+        self.time_embed = TimestepEmbedding(embed_dim, cond_dim)
+
+        # Text projection: map CLIP dim to model's context dim
+        # This allows flexibility in context_dim used in cross-attention
+        self.text_proj = nn.Linear(context_dim, context_dim)
+
+        # Transformer blocks with cross-attention
+        self.blocks = nn.ModuleList([
+            TextConditionedDiTBlock(
+                embed_dim, num_heads, cond_dim, context_dim, mlp_ratio, dropout
+            )
+            for _ in range(depth)
+        ])
+
+        # Final layers
+        self.final_norm = nn.LayerNorm(embed_dim)
+        patch_dim = patch_size * patch_size * in_channels
+        self.final_proj = nn.Linear(embed_dim, patch_dim)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights following DiT paper recommendations."""
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        self.apply(_basic_init)
+
+        # Zero-init the final projection for stable training
+        nn.init.zeros_(self.final_proj.weight)
+        nn.init.zeros_(self.final_proj.bias)
+
+    def unpatchify(self, x: Tensor) -> Tensor:
+        """
+        Convert patch predictions back to image.
+
+        Args:
+            x: Patch predictions of shape (B, num_patches, patch_dim)
+
+        Returns:
+            Image of shape (B, C, H, W)
+        """
+        B = x.shape[0]
+        p = self.patch_size
+        h = w = self.img_size // p
+        c = self.in_channels
+
+        x = x.view(B, h, w, p, p, c)
+        x = x.permute(0, 5, 1, 3, 2, 4)
+        x = x.reshape(B, c, h * p, w * p)
+
+        return x
+
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Predict velocity field given noisy image, timestep, and text.
+
+        Args:
+            x: Noisy images of shape (B, C, H, W).
+            t: Timesteps in [0, 1] of shape (B,).
+            context: Text embeddings of shape (B, M, context_dim).
+                These come from CLIP text encoder.
+            context_mask: Optional attention mask of shape (B, M).
+                True for real tokens, False for padding.
+
+        Returns:
+            Predicted velocity of shape (B, C, H, W).
+
+        Forward Pass Details
+        --------------------
+        1. Patchify image: (B, C, H, W) -> (B, N, embed_dim)
+        2. Add positional embeddings
+        3. Embed timestep: t -> c in R^{cond_dim}
+        4. Project text: context -> context' (optional dim change)
+        5. Process through DiT blocks with cross-attention
+        6. Final norm and projection
+        7. Unpatchify: (B, N, patch_dim) -> (B, C, H, W)
+        """
+        # Patchify and embed
+        x = self.patch_embed(x)  # (B, num_patches, embed_dim)
+
+        # Add positional embeddings
+        x = self.pos_embed(x)
+
+        # Get timestep conditioning
+        cond = self.time_embed(t)  # (B, cond_dim)
+
+        # Project text embeddings (identity if dims match, else learned projection)
+        context = self.text_proj(context)  # (B, M, context_dim)
+
+        # Process through transformer blocks with cross-attention
+        for block in self.blocks:
+            x = block(x, cond, context, context_mask)
 
         # Final projection
         x = self.final_norm(x)

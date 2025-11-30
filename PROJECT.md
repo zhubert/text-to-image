@@ -88,7 +88,7 @@ v_guided = v_uncond + scale × (v_cond - v_uncond)
 
 ---
 
-## Phase 4: Text Conditioning with CLIP
+## Phase 4: Text Conditioning with CLIP ✓
 
 **Goal**: Move from class labels to actual text prompts
 
@@ -103,6 +103,24 @@ v_guided = v_uncond + scale × (v_cond - v_uncond)
 3. Dataset: CIFAR-10 (32×32 color) with class names as captions
    - "a photo of a dog", "a photo of an airplane", etc.
 4. Train DiT to attend to text embeddings
+
+### Key Components
+- `CLIPTextEncoder`: Wrapper around HuggingFace CLIP text encoder
+- `CrossAttention`: Attention from image patches to text tokens
+- `TextConditionedDiTBlock`: DiT block with self-attention + cross-attention + MLP
+- `TextConditionalDiT`: Full model with cross-attention to CLIP embeddings
+- `TextConditionalTrainer`: Training with text dropout for CFG
+- `sample_text_conditional()`: Generation with text prompts and CFG
+
+### Cross-Attention Formula
+```
+CrossAttn(X, Z) = softmax(Q @ K^T / sqrt(d)) @ V
+
+where:
+  Q = X @ W_Q  (queries from image patches)
+  K = Z @ W_K  (keys from text tokens)
+  V = Z @ W_V  (values from text tokens)
+```
 
 ### Outcome
 "a photo of a cat" → produces cat-like image.

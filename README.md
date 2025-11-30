@@ -19,13 +19,15 @@ text-to-image/
 ├── notebooks/
 │   ├── 01_flow_matching_basics.ipynb  # Phase 1: Unconditional generation
 │   ├── 02_diffusion_transformer.ipynb # Phase 2: DiT architecture
-│   └── 03_class_conditioning.ipynb    # Phase 3: Class-conditional + CFG
+│   ├── 03_class_conditioning.ipynb    # Phase 3: Class-conditional + CFG
+│   └── 04_text_conditioning.ipynb     # Phase 4: Text-conditional + CLIP
 └── text_to_image/
-    ├── flow.py      # Flow matching training logic
-    ├── dit.py       # Diffusion Transformer architecture
-    ├── models.py    # CNN/U-Net architectures
-    ├── sampling.py  # Image generation (unconditional + CFG)
-    └── train.py     # Training utilities
+    ├── flow.py         # Flow matching training logic
+    ├── dit.py          # DiT, ConditionalDiT, TextConditionalDiT
+    ├── text_encoder.py # CLIP text encoder wrapper
+    ├── models.py       # CNN/U-Net architectures
+    ├── sampling.py     # Image generation (unconditional, class, text CFG)
+    └── train.py        # Training utilities
 ```
 
 ## Phases
@@ -67,6 +69,30 @@ samples = sample_conditional(
     model,
     class_labels=[7, 7, 7, 7],  # Generate four 7s
     cfg_scale=4.0
+)
+```
+
+### Phase 4: Text Conditioning with CLIP
+
+Move from class labels to natural language prompts using CLIP embeddings.
+
+- **CLIP encoder**: Frozen pretrained text encoder converts prompts to embeddings
+- **Cross-attention**: Image patches attend to text tokens for fine-grained control
+- **Text dropout**: 10% dropout enables CFG with null text embeddings
+- **CFG formula**: Same as class-conditional, but with text embeddings
+
+```python
+from text_to_image import TextConditionalDiT, CLIPTextEncoder, sample_text_conditional
+
+text_encoder = CLIPTextEncoder()
+model = TextConditionalDiT(context_dim=512)
+# ... train model ...
+
+# Generate from text prompts with CFG
+samples = sample_text_conditional(
+    model, text_encoder,
+    prompts=["a photo of a cat", "a photo of a dog"],
+    cfg_scale=7.5
 )
 ```
 
