@@ -308,6 +308,433 @@ class ConditionalTrainer:
 
 
 # =============================================================================
+# Phase 5: VAE Trainer and Latent Diffusion Trainer
+# =============================================================================
+
+
+class VAETrainer:
+    """
+    Training loop for Variational Autoencoder.
+
+    The VAE is trained to reconstruct images while keeping the latent space
+    regularized (close to a standard normal distribution).
+
+    Loss Function
+    -------------
+    L = L_recon + β × L_KL
+
+    where:
+        L_recon = ||x - decode(encode(x))||²   (reconstruction)
+        L_KL = KL(q(z|x) || N(0,I))            (regularization)
+
+    For latent diffusion, we use very small β (e.g., 0.00001) to prioritize
+    reconstruction quality. The diffusion model handles generation.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataloader,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        kl_weight: float = 0.00001,
+        device=None,
+    ):
+        """
+        Args:
+            model: VAE model to train.
+            dataloader: DataLoader providing training batches.
+            lr: Learning rate.
+            weight_decay: AdamW weight decay.
+            kl_weight: Weight for KL divergence term (β).
+            device: Device to train on (auto-detected if None).
+        """
+        self.device = device or get_device()
+        self.model = model.to(self.device)
+        self.dataloader = dataloader
+        self.kl_weight = kl_weight
+
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+
+        self.losses: list[float] = []
+        self.recon_losses: list[float] = []
+        self.kl_losses: list[float] = []
+
+    def train_epoch(self, epoch: int, total_epochs: int) -> dict[str, float]:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_recon = 0.0
+        total_kl = 0.0
+        num_batches = 0
+
+        pbar = tqdm(
+            self.dataloader,
+            desc=f"Epoch {epoch + 1}/{total_epochs}",
+            leave=True
+        )
+
+        for batch in pbar:
+            if isinstance(batch, (list, tuple)):
+                images = batch[0]
+            else:
+                images = batch
+
+            images = images.to(self.device)
+
+            # Compute VAE loss
+            loss, metrics = self.model.loss(images, kl_weight=self.kl_weight)
+
+            # Backprop
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # Track losses
+            total_loss += metrics['loss']
+            total_recon += metrics['recon_loss']
+            total_kl += metrics['kl_loss']
+            num_batches += 1
+
+            pbar.set_postfix({
+                "loss": f"{metrics['loss']:.4f}",
+                "recon": f"{metrics['recon_loss']:.4f}",
+            })
+
+        avg_metrics = {
+            'loss': total_loss / num_batches,
+            'recon_loss': total_recon / num_batches,
+            'kl_loss': total_kl / num_batches,
+        }
+
+        self.losses.append(avg_metrics['loss'])
+        self.recon_losses.append(avg_metrics['recon_loss'])
+        self.kl_losses.append(avg_metrics['kl_loss'])
+
+        return avg_metrics
+
+    def train(self, num_epochs: int, save_path: str | None = None) -> list[float]:
+        """Run the full training loop."""
+        print(f"Training VAE on {self.device}")
+        print(f"Model parameters: {count_parameters(self.model):,}")
+        print(f"KL weight (β): {self.kl_weight}")
+
+        for epoch in range(num_epochs):
+            metrics = self.train_epoch(epoch, num_epochs)
+            print(f"Epoch {epoch + 1}: loss={metrics['loss']:.4f}, "
+                  f"recon={metrics['recon_loss']:.4f}, kl={metrics['kl_loss']:.4f}")
+
+        # Compute scale factor after training
+        print("\nComputing latent scale factor...")
+        scale = self.model.compute_scale_factor(self.dataloader)
+        print(f"Scale factor: {scale:.4f}")
+
+        if save_path:
+            self.save_checkpoint(save_path)
+            print(f"Saved checkpoint to {save_path}")
+
+        return self.losses
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save model checkpoint."""
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "losses": self.losses,
+            "recon_losses": self.recon_losses,
+            "kl_losses": self.kl_losses,
+            "scale_factor": self.model.scale_factor.item(),
+        }, path)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.losses = checkpoint.get("losses", [])
+
+
+class LatentDiffusionTrainer:
+    """
+    Training loop for latent space flow matching.
+
+    This trainer operates on VAE-encoded latents instead of raw pixels.
+    The workflow is:
+        1. Encode images with frozen VAE: x → z
+        2. Apply flow matching in latent space
+        3. Train DiT to predict velocity in latent space
+
+    Key Insight
+    -----------
+    By working in latent space, we can train on smaller tensors:
+        - Pixel space: 64×64×3 = 12,288 dimensions
+        - Latent space: 8×8×4 = 256 dimensions (48× smaller!)
+
+    This enables higher resolution generation without proportionally
+    increasing compute cost.
+    """
+
+    def __init__(
+        self,
+        model,
+        vae,
+        dataloader,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        device=None,
+    ):
+        """
+        Args:
+            model: DiT model for velocity prediction in latent space.
+            vae: Trained VAE (frozen during training).
+            dataloader: DataLoader providing training batches.
+            lr: Learning rate.
+            weight_decay: AdamW weight decay.
+            device: Device to train on.
+        """
+        self.device = device or get_device()
+        self.model = model.to(self.device)
+        self.vae = vae.to(self.device)
+        self.vae.eval()  # VAE is frozen
+        for param in self.vae.parameters():
+            param.requires_grad = False
+
+        self.dataloader = dataloader
+
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+
+        self.flow = FlowMatching()
+        self.losses: list[float] = []
+
+    def train_epoch(self, epoch: int, total_epochs: int) -> float:
+        """Train for one epoch in latent space."""
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(
+            self.dataloader,
+            desc=f"Epoch {epoch + 1}/{total_epochs}",
+            leave=True
+        )
+
+        for batch in pbar:
+            if isinstance(batch, (list, tuple)):
+                images = batch[0]
+            else:
+                images = batch
+
+            images = images.to(self.device)
+
+            # Encode to latent space (no gradient through VAE)
+            with torch.no_grad():
+                z_0 = self.vae.encode(images, sample=False)  # Use mean, not sample
+
+            # Flow matching in latent space
+            batch_size = z_0.shape[0]
+            z_1 = torch.randn_like(z_0)
+            t = torch.rand(batch_size, device=self.device)
+
+            # Interpolate in latent space
+            t_expand = t.view(-1, 1, 1, 1)
+            z_t = (1 - t_expand) * z_0 + t_expand * z_1
+            v_target = z_1 - z_0
+
+            # Predict velocity
+            v_pred = self.model(z_t, t)
+
+            # MSE loss
+            loss = torch.mean((v_pred - v_target) ** 2)
+
+            # Backprop
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        avg_loss = total_loss / num_batches
+        self.losses.append(avg_loss)
+        return avg_loss
+
+    def train(self, num_epochs: int, save_path: str | None = None) -> list[float]:
+        """Run the full training loop."""
+        print(f"Training Latent Diffusion on {self.device}")
+        print(f"DiT parameters: {count_parameters(self.model):,}")
+        print(f"VAE parameters: {count_parameters(self.vae):,} (frozen)")
+
+        for epoch in range(num_epochs):
+            avg_loss = self.train_epoch(epoch, num_epochs)
+            print(f"Epoch {epoch + 1}: avg_loss = {avg_loss:.4f}")
+
+        if save_path:
+            self.save_checkpoint(save_path)
+            print(f"Saved checkpoint to {save_path}")
+
+        return self.losses
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save model checkpoint (only DiT, not VAE)."""
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "losses": self.losses,
+        }, path)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.losses = checkpoint.get("losses", [])
+
+
+class LatentConditionalTrainer:
+    """
+    Training loop for class-conditional latent diffusion.
+
+    Combines latent space flow matching with class conditioning and CFG.
+    """
+
+    def __init__(
+        self,
+        model,
+        vae,
+        dataloader,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        label_drop_prob: float = 0.1,
+        num_classes: int = 10,
+        device=None,
+    ):
+        """
+        Args:
+            model: ConditionalDiT for latent space.
+            vae: Trained VAE (frozen).
+            dataloader: DataLoader providing (images, labels).
+            lr: Learning rate.
+            weight_decay: AdamW weight decay.
+            label_drop_prob: Probability of dropping labels for CFG.
+            num_classes: Number of classes.
+            device: Device to train on.
+        """
+        self.device = device or get_device()
+        self.model = model.to(self.device)
+        self.vae = vae.to(self.device)
+        self.vae.eval()
+        for param in self.vae.parameters():
+            param.requires_grad = False
+
+        self.dataloader = dataloader
+        self.label_drop_prob = label_drop_prob
+        self.num_classes = num_classes
+
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+
+        self.losses: list[float] = []
+
+    def train_epoch(self, epoch: int, total_epochs: int) -> float:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(
+            self.dataloader,
+            desc=f"Epoch {epoch + 1}/{total_epochs}",
+            leave=True
+        )
+
+        for batch in pbar:
+            images, labels = batch
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+
+            # Encode to latent space
+            with torch.no_grad():
+                z_0 = self.vae.encode(images, sample=False)
+
+            batch_size = z_0.shape[0]
+
+            # Sample noise and timesteps
+            z_1 = torch.randn_like(z_0)
+            t = torch.rand(batch_size, device=self.device)
+
+            # Interpolate
+            t_expand = t.view(-1, 1, 1, 1)
+            z_t = (1 - t_expand) * z_0 + t_expand * z_1
+            v_target = z_1 - z_0
+
+            # Apply label dropout for CFG
+            drop_mask = torch.rand(batch_size, device=self.device) < self.label_drop_prob
+            labels_with_dropout = labels.clone()
+            labels_with_dropout[drop_mask] = self.num_classes  # Null class
+
+            # Predict velocity
+            v_pred = self.model(z_t, t, labels_with_dropout)
+
+            # MSE loss
+            loss = torch.mean((v_pred - v_target) ** 2)
+
+            # Backprop
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        avg_loss = total_loss / num_batches
+        self.losses.append(avg_loss)
+        return avg_loss
+
+    def train(self, num_epochs: int, save_path: str | None = None) -> list[float]:
+        """Run the full training loop."""
+        print(f"Training Latent Conditional Diffusion on {self.device}")
+        print(f"DiT parameters: {count_parameters(self.model):,}")
+        print(f"CFG label dropout: {self.label_drop_prob * 100:.0f}%")
+
+        for epoch in range(num_epochs):
+            avg_loss = self.train_epoch(epoch, num_epochs)
+            print(f"Epoch {epoch + 1}: avg_loss = {avg_loss:.4f}")
+
+        if save_path:
+            self.save_checkpoint(save_path)
+
+        return self.losses
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save checkpoint."""
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "losses": self.losses,
+        }, path)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.losses = checkpoint.get("losses", [])
+
+
+# =============================================================================
 # Phase 4: Text-Conditional Trainer
 # =============================================================================
 

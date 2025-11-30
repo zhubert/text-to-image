@@ -574,3 +574,221 @@ def sample_with_prompt_variations(
         cfg_scale=cfg_scale,
         device=device,
     )
+
+
+# =============================================================================
+# Phase 5: Latent Space Sampling
+# =============================================================================
+
+
+@torch.no_grad()
+def sample_latent(
+    model: nn.Module,
+    vae: nn.Module,
+    num_samples: int,
+    latent_shape: tuple[int, ...],
+    num_steps: int = 50,
+    device: torch.device | None = None,
+    return_trajectory: bool = False,
+) -> Tensor | tuple[Tensor, list[Tensor]]:
+    """
+    Generate images via latent space flow matching.
+
+    Algorithm
+    ---------
+    1. Sample noise in latent space: z_1 ~ N(0, I)
+    2. Integrate the ODE from t=1 to t=0 in latent space
+    3. Decode the final latent to pixel space: x = decode(z_0)
+
+    This is the core of Stable Diffusion-style generation:
+    - Flow matching happens in the small latent space (fast!)
+    - VAE decodes to high-resolution pixels (quality!)
+
+    Args:
+        model: Trained velocity prediction model for latent space.
+        vae: Trained VAE for decoding latents to images.
+        num_samples: Number of images to generate.
+        latent_shape: Shape of latent (C, H, W), e.g., (4, 8, 8).
+        num_steps: Number of integration steps.
+        device: Device to run on.
+        return_trajectory: If True, also return intermediate latents.
+
+    Returns:
+        Generated images of shape (num_samples, C_img, H_img, W_img).
+        If return_trajectory=True, also returns list of intermediate latents.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    model.eval()
+    vae.eval()
+
+    # Start from pure noise in latent space at t=1
+    z = torch.randn(num_samples, *latent_shape, device=device)
+
+    # Integration timesteps from t=1 to t=0
+    timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+    dt = 1.0 / num_steps
+
+    trajectory = [z.clone()] if return_trajectory else []
+
+    # Euler integration in latent space
+    for i in tqdm(range(num_steps), desc="Sampling (Latent)", leave=False):
+        t = timesteps[i]
+        t_batch = torch.full((num_samples,), t, device=device)
+
+        # Predict velocity in latent space
+        v = model(z, t_batch)
+
+        # Euler step
+        z = z - dt * v
+
+        if return_trajectory:
+            trajectory.append(z.clone())
+
+    # Decode final latent to image
+    images = vae.decode(z)
+
+    if return_trajectory:
+        return images, trajectory
+    return images
+
+
+@torch.no_grad()
+def sample_latent_conditional(
+    model: nn.Module,
+    vae: nn.Module,
+    class_labels: Tensor | int | list[int],
+    latent_shape: tuple[int, ...],
+    num_steps: int = 50,
+    cfg_scale: float = 3.0,
+    device: torch.device | None = None,
+    num_classes: int = 10,
+) -> Tensor:
+    """
+    Generate class-conditional images via latent space with CFG.
+
+    This combines:
+    - Latent space flow matching (efficiency)
+    - Class conditioning (control)
+    - Classifier-free guidance (quality)
+
+    Algorithm
+    ---------
+    For each step t from 1 to 0:
+        1. Predict v_cond = model(z_t, t, class)
+        2. Predict v_uncond = model(z_t, t, null_class)
+        3. Apply CFG: v = v_uncond + scale * (v_cond - v_uncond)
+        4. Euler step: z_{t-dt} = z_t - dt * v
+
+    Final: decode(z_0) to get image
+
+    Args:
+        model: Trained ConditionalDiT for latent space.
+        vae: Trained VAE for decoding.
+        class_labels: Target class(es) to generate.
+        latent_shape: Shape of latent (C, H, W).
+        num_steps: Number of integration steps.
+        cfg_scale: Classifier-free guidance scale.
+        device: Device to run on.
+        num_classes: Number of classes.
+
+    Returns:
+        Generated images of shape (B, C, H, W).
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    model.eval()
+    vae.eval()
+
+    # Handle different input formats for class labels
+    if isinstance(class_labels, int):
+        class_labels = torch.tensor([class_labels], device=device)
+    elif isinstance(class_labels, list):
+        class_labels = torch.tensor(class_labels, device=device)
+    else:
+        class_labels = class_labels.to(device)
+
+    num_samples = class_labels.shape[0]
+
+    # Create null class labels for unconditional
+    null_labels = torch.full(
+        (num_samples,), num_classes,
+        dtype=torch.long, device=device
+    )
+
+    # Start from noise in latent space
+    z = torch.randn(num_samples, *latent_shape, device=device)
+
+    timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+    dt = 1.0 / num_steps
+
+    # Euler integration with CFG
+    for i in tqdm(range(num_steps), desc="Sampling (Latent CFG)", leave=False):
+        t = timesteps[i]
+        t_batch = torch.full((num_samples,), t, device=device)
+
+        # CFG: conditional and unconditional predictions
+        v_cond = model(z, t_batch, class_labels)
+        v_uncond = model(z, t_batch, null_labels)
+
+        # CFG blending
+        v = v_uncond + cfg_scale * (v_cond - v_uncond)
+
+        # Euler step
+        z = z - dt * v
+
+    # Decode to image
+    images = vae.decode(z)
+
+    return images
+
+
+@torch.no_grad()
+def sample_latent_each_class(
+    model: nn.Module,
+    vae: nn.Module,
+    num_per_class: int = 1,
+    latent_shape: tuple[int, ...] = (4, 8, 8),
+    num_steps: int = 50,
+    cfg_scale: float = 3.0,
+    device: torch.device | None = None,
+    num_classes: int = 10,
+) -> Tensor:
+    """
+    Generate samples for each class via latent diffusion.
+
+    Convenience function for visualization.
+
+    Args:
+        model: Trained ConditionalDiT for latent space.
+        vae: Trained VAE.
+        num_per_class: Samples per class.
+        latent_shape: Latent shape (C, H, W).
+        num_steps: Integration steps.
+        cfg_scale: CFG scale.
+        device: Device.
+        num_classes: Number of classes.
+
+    Returns:
+        Images of shape (num_classes * num_per_class, C, H, W).
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    labels = torch.repeat_interleave(
+        torch.arange(num_classes, device=device),
+        num_per_class
+    )
+
+    return sample_latent_conditional(
+        model=model,
+        vae=vae,
+        class_labels=labels,
+        latent_shape=latent_shape,
+        num_steps=num_steps,
+        cfg_scale=cfg_scale,
+        device=device,
+        num_classes=num_classes,
+    )

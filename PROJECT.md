@@ -127,24 +127,63 @@ where:
 
 ---
 
-## Phase 5 (Optional): Latent Space with VAE
+## Phase 5: Latent Space with VAE ✓
 
-**Goal**: Scale to larger images efficiently
+**Goal**: Scale to larger images efficiently by performing flow matching in compressed latent space
 
 ### What You'll Learn
-- Why pixel space doesn't scale
-- How VAEs compress images
+- Why pixel space doesn't scale (computational cost grows quadratically)
+- How VAEs compress images while preserving perceptual quality
+- The reparameterization trick for differentiable sampling
 - The full Stable Diffusion-style pipeline
 
+### The Scaling Problem
+
+Pixel-space diffusion has O(N²) attention cost where N = number of patches:
+- 32×32 with 4×4 patches = 64 tokens → 4,096 attention pairs
+- 256×256 with 4×4 patches = 4,096 tokens → 16,777,216 attention pairs (4096× more!)
+
+Latent diffusion solves this by compressing images first:
+- 256×256×3 image → 32×32×4 latent (48× compression)
+- Flow matching operates on the small latent
+- Final latent is decoded back to pixels
+
 ### Implementation
-1. Train or use pretrained VAE
-2. Encode images → latent space
-3. Run flow matching in latent space
-4. Decode generated latents → images
-5. Scale to 64×64 or 128×128
+1. Train VAE with reconstruction + KL loss
+2. Encode training images → latent space
+3. Train DiT for flow matching in latent space (VAE frozen)
+4. Sample: noise in latent → ODE integration → decode to pixels
+
+### Key Components
+- `VAE` / `SmallVAE`: Encoder-decoder with reparameterization
+- `VAETrainer`: Training loop with reconstruction + KL loss
+- `LatentDiffusionTrainer`: Flow matching in latent space
+- `LatentConditionalTrainer`: Class-conditional latent diffusion
+- `sample_latent()`: Generate via latent space ODE + decode
+- `sample_latent_conditional()`: Class-conditional latent generation with CFG
+
+### VAE Loss
+```
+L_VAE = L_recon + β × L_KL
+      = ||x - decode(encode(x))||² + β × KL(q(z|x) || N(0,I))
+```
+
+For latent diffusion, β ≈ 0.00001 (prioritize reconstruction quality).
+
+### Reparameterization Trick
+To backpropagate through sampling z ~ N(μ, σ²):
+```
+z = μ + σ × ε,  where ε ~ N(0, I)
+```
+
+### Compression Ratios
+| Resolution | Pixel Dims | Latent Dims | Compression |
+|------------|------------|-------------|-------------|
+| 32×32×3 | 3,072 | 8×8×4 = 256 | 12× |
+| 256×256×3 | 196,608 | 32×32×4 = 4,096 | 48× |
 
 ### Outcome
-Higher resolution generations, complete understanding of modern text-to-image.
+Higher resolution generations, complete understanding of Stable Diffusion architecture.
 
 ---
 
