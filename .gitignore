@@ -20,3 +20,7 @@ notebooks/data/
 
 # Backup files
 *.bak
+
+# Model checkpoints
+*.pt
+*.pth

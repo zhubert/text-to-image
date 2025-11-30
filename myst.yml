@@ -14,6 +14,8 @@ project:
     - file: intro.md
     - file: notebooks/01_flow_matching_basics.ipynb
       title: "Phase 1: Flow Matching"
+    - file: notebooks/02_diffusion_transformer.ipynb
+      title: "Phase 2: Diffusion Transformer"
 site:
   options:
     logo: opticus.png
